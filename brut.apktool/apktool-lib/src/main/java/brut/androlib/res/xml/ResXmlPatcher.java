@@ -51,15 +51,15 @@ public final class ResXmlPatcher {
         if (file.exists()) {
             try {
                 Document doc = loadDocument(file);
-                Node application = doc.getElementById("application");
+                Node application = doc.getElementsByTagName("application").item(0);
 
                 // load attr
                 NamedNodeMap attr = application.getAttributes();
-                Node debugAttr = attr.getNamedItem("debug");
+                Node debugAttr = attr.getNamedItem("android:debuggable");
 
-                // remove application:debug
+                // remove application:debuggable
                 if (debugAttr != null) {
-                    attr.removeNamedItem("debug");
+                    attr.removeNamedItem("android:debuggable");
                 }
 
                 saveDocument(file, doc);
@@ -125,7 +125,7 @@ public final class ResXmlPatcher {
      * @throws AndrolibException
      */
     public static String pullValueFromStrings(File directory, String key) throws AndrolibException {
-        if (! key.contains("@")) {
+        if (key == null || ! key.contains("@")) {
             return null;
         }
 

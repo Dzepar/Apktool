@@ -23,7 +23,7 @@ import brut.androlib.res.data.value.*;
 import brut.util.Duo;
 import brut.androlib.res.data.ResTable;
 import brut.util.ExtDataInput;
-import com.mindprod.ledatastream.LEDataInputStream;
+import com.peterfranza.LittleEndianDataInputStream;
 import java.io.*;
 import java.math.BigInteger;
 import java.util.*;
@@ -44,7 +44,7 @@ public class ARSCDecoder {
             throws AndrolibException {
         try {
             ARSCDecoder decoder = new ARSCDecoder(arscStream, resTable, findFlagsOffsets, keepBroken);
-            ResPackage[] pkgs = decoder.readTable();
+            ResPackage[] pkgs = decoder.readTableHeader();
             return new ARSCData(pkgs, decoder.mFlagsOffsets == null
                     ? null
                     : decoder.mFlagsOffsets.toArray(new FlagsOffset[0]), resTable);
@@ -54,19 +54,18 @@ public class ARSCDecoder {
     }
 
     private ARSCDecoder(InputStream arscStream, ResTable resTable, boolean storeFlagsOffsets, boolean keepBroken) {
+        arscStream = mCountIn = new CountingInputStream(arscStream);
         if (storeFlagsOffsets) {
-            arscStream = mCountIn = new CountingInputStream(arscStream);
             mFlagsOffsets = new ArrayList<FlagsOffset>();
         } else {
-            mCountIn = null;
             mFlagsOffsets = null;
         }
-        mIn = new ExtDataInput(new LEDataInputStream(arscStream));
+        mIn = new ExtDataInput(new LittleEndianDataInputStream(arscStream));
         mResTable = resTable;
         mKeepBroken = keepBroken;
     }
 
-    private ResPackage[] readTable() throws IOException, AndrolibException {
+    private ResPackage[] readTableHeader() throws IOException, AndrolibException {
         nextChunkCheckType(Header.TYPE_TABLE);
         int packageCount = mIn.readInt();
 
@@ -75,12 +74,12 @@ public class ARSCDecoder {
 
         nextChunk();
         for (int i = 0; i < packageCount; i++) {
-            packages[i] = readPackage();
+            packages[i] = readTablePackage();
         }
         return packages;
     }
 
-    private ResPackage readPackage() throws IOException, AndrolibException {
+    private ResPackage readTablePackage() throws IOException, AndrolibException {
         checkChunkType(Header.TYPE_PACKAGE);
         int id = (byte) mIn.readInt();
 
@@ -96,10 +95,10 @@ public class ARSCDecoder {
         }
 
         String name = mIn.readNullEndedString(128, true);
-		/* typeStrings */mIn.skipInt();
-		/* lastPublicType */mIn.skipInt();
-		/* keyStrings */mIn.skipInt();
-		/* lastPublicKey */mIn.skipInt();
+        /* typeStrings */mIn.skipInt();
+        /* lastPublicType */mIn.skipInt();
+        /* keyStrings */mIn.skipInt();
+        /* lastPublicKey */mIn.skipInt();
 
         mTypeNames = StringBlock.read(mIn);
         mSpecNames = StringBlock.read(mIn);
@@ -112,8 +111,8 @@ public class ARSCDecoder {
             readLibraryType();
         }
 
-        while (mHeader.type == Header.TYPE_TYPE) {
-            readType();
+        while (mHeader.type == Header.TYPE_SPEC_TYPE) {
+            readTableTypeSpec();
         }
 
         return mPkg;
@@ -132,49 +131,76 @@ public class ARSCDecoder {
             LOGGER.info(String.format("Decoding Shared Library (%s), pkgId: %d", packageName, packageId));
         }
 
-        while(nextChunk().type == Header.TYPE_CONFIG) {
-            readConfig();
+        while(nextChunk().type == Header.TYPE_TYPE) {
+            readTableTypeSpec();
         }
     }
 
-    private ResType readType() throws AndrolibException, IOException {
-        checkChunkType(Header.TYPE_TYPE);
+    private ResTypeSpec readTableTypeSpec() throws AndrolibException, IOException {
+        mTypeSpec = readSingleTableTypeSpec();
+        addTypeSpec(mTypeSpec);
+
+        int type = nextChunk().type;
+        ResTypeSpec resTypeSpec;
+
+        while (type == Header.TYPE_SPEC_TYPE) {
+            resTypeSpec = readSingleTableTypeSpec();
+            addTypeSpec(resTypeSpec);
+            type = nextChunk().type;
+        }
+
+        while (type == Header.TYPE_TYPE) {
+            readTableType();
+            type = nextChunk().type;
+
+            addMissingResSpecs();
+        }
+
+        return mTypeSpec;
+    }
+
+    private ResTypeSpec readSingleTableTypeSpec() throws AndrolibException, IOException {
+        checkChunkType(Header.TYPE_SPEC_TYPE);
         byte id = mIn.readByte();
         mIn.skipBytes(3);
         int entryCount = mIn.readInt();
 
-        mMissingResSpecs = new boolean[entryCount];
-        Arrays.fill(mMissingResSpecs, true);
-
         if (mFlagsOffsets != null) {
             mFlagsOffsets.add(new FlagsOffset(mCountIn.getCount(), entryCount));
         }
+
 		/* flags */mIn.skipBytes(entryCount * 4);
-
-        mResId = (0xff000000 & mResId) | id << 16;
-        mType = new ResType(mTypeNames.getString(id - 1), mResTable, mPkg);
-        mPkg.addType(mType);
-
-        while (nextChunk().type == Header.TYPE_CONFIG) {
-            readConfig();
-        }
-
-        addMissingResSpecs();
-
-        return mType;
+        mTypeSpec = new ResTypeSpec(mTypeNames.getString(id - 1), mResTable, mPkg, id, entryCount);
+        mPkg.addType(mTypeSpec);
+        return mTypeSpec;
     }
 
-    private ResConfig readConfig() throws IOException, AndrolibException {
-        checkChunkType(Header.TYPE_CONFIG);
-		/* typeId */mIn.skipInt();
+    private ResType readTableType() throws IOException, AndrolibException {
+        checkChunkType(Header.TYPE_TYPE);
+        byte typeId = mIn.readByte();
+        if (mResTypeSpecs.containsKey(typeId)) {
+            mResId = (0xff000000 & mResId) | mResTypeSpecs.get(typeId).getId() << 16;
+            mTypeSpec = mResTypeSpecs.get(typeId);
+        }
+
+        /* res0, res1 */mIn.skipBytes(3);
         int entryCount = mIn.readInt();
-		/* entriesStart */mIn.skipInt();
+        int entriesStart = mIn.readInt();
+        mMissingResSpecs = new boolean[entryCount];
+        Arrays.fill(mMissingResSpecs, true);
 
         ResConfigFlags flags = readConfigFlags();
+        int position = (mHeader.startPosition + entriesStart) - (entryCount * 4);
+
+        // For some APKs there is a disconnect between the reported size of Configs
+        // If we find a mismatch skip those bytes.
+        if (position != mCountIn.getCount()) {
+            mIn.skipBytes(position - mCountIn.getCount());
+        }
         int[] entryOffsets = mIn.readIntArray(entryCount);
 
         if (flags.isInvalid) {
-            String resName = mType.getName() + flags.getQualifiers();
+            String resName = mTypeSpec.getName() + flags.getQualifiers();
             if (mKeepBroken) {
                 LOGGER.warning("Invalid config flags detected: " + resName);
             } else {
@@ -182,7 +208,7 @@ public class ARSCDecoder {
             }
         }
 
-        mConfig = flags.isInvalid && !mKeepBroken ? null : mPkg.getOrCreateConfig(flags);
+        mType = flags.isInvalid && !mKeepBroken ? null : mPkg.getOrCreateConfig(flags);
 
         for (int i = 0; i < entryOffsets.length; i++) {
             if (entryOffsets[i] != -1) {
@@ -192,20 +218,23 @@ public class ARSCDecoder {
             }
         }
 
-        return mConfig;
+        return mType;
     }
 
     private void readEntry() throws IOException, AndrolibException {
-		/* size */mIn.skipBytes(2);
+        short size = mIn.readShort();
+        if (size < 0) {
+            throw new AndrolibException("Entry size is under 0 bytes.");
+        }
         short flags = mIn.readShort();
         int specNamesId = mIn.readInt();
 
         ResValue value = (flags & ENTRY_FLAG_COMPLEX) == 0 ? readValue() : readComplexEntry();
 
-        if (mType.isString() && value instanceof ResFileValue) {
-            value = new ResStringValue(value.toString());
+        if (mTypeSpec.isString() && value instanceof ResFileValue) {
+            value = new ResStringValue(value.toString(), ((ResFileValue) value).getRawIntValue());
         }
-        if (mConfig == null) {
+        if (mType == null) {
             return;
         }
 
@@ -213,36 +242,53 @@ public class ARSCDecoder {
         ResResSpec spec;
         if (mPkg.hasResSpec(resId)) {
             spec = mPkg.getResSpec(resId);
-        } else {
-            spec = new ResResSpec(resId, mSpecNames.getString(specNamesId), mPkg, mType);
-            mPkg.addResSpec(spec);
-            mType.addResSpec(spec);
-        }
-        ResResource res = new ResResource(mConfig, spec, value);
 
-        mConfig.addResource(res);
-        spec.addResource(res);
+            if (spec.isDummyResSpec()) {
+                removeResSpec(spec);
+
+                spec = new ResResSpec(resId, mSpecNames.getString(specNamesId), mPkg, mTypeSpec);
+                mPkg.addResSpec(spec);
+                mTypeSpec.addResSpec(spec);
+            }
+        } else {
+            spec = new ResResSpec(resId, mSpecNames.getString(specNamesId), mPkg, mTypeSpec);
+            mPkg.addResSpec(spec);
+            mTypeSpec.addResSpec(spec);
+        }
+        ResResource res = new ResResource(mType, spec, value);
+
+        try {
+            mType.addResource(res);
+            spec.addResource(res);
+        } catch (AndrolibException ex) {
+            if (mKeepBroken) {
+                mType.addResource(res, true);
+                spec.addResource(res, true);
+                LOGGER.warning(String.format("Duplicate Resource Detected. Ignoring duplicate: %s", res.toString()));
+            } else {
+                throw ex;
+            }
+        }
         mPkg.addResource(res);
     }
 
-    private ResBagValue readComplexEntry() throws IOException,
-            AndrolibException {
+    private ResBagValue readComplexEntry() throws IOException, AndrolibException {
         int parent = mIn.readInt();
         int count = mIn.readInt();
 
         ResValueFactory factory = mPkg.getValueFactory();
         Duo<Integer, ResScalarValue>[] items = new Duo[count];
-        ResValue resValue;
+        ResIntBasedValue resValue;
         int resId;
 
         for (int i = 0; i < count; i++) {
             resId = mIn.readInt();
             resValue = readValue();
 
-            try {
+            if (resValue instanceof ResScalarValue) {
                 items[i] = new Duo<Integer, ResScalarValue>(resId, (ResScalarValue) resValue);
-            } catch (ClassCastException ex) {
-                resValue = new ResStringValue(resValue.toString());
+            } else {
+                resValue = new ResStringValue(resValue.toString(), resValue.getRawIntValue());
                 items[i] = new Duo<Integer, ResScalarValue>(resId, (ResScalarValue) resValue);
             }
         }
@@ -250,21 +296,20 @@ public class ARSCDecoder {
         return factory.bagFactory(parent, items);
     }
 
-    private ResValue readValue() throws IOException, AndrolibException {
+    private ResIntBasedValue readValue() throws IOException, AndrolibException {
 		/* size */mIn.skipCheckShort((short) 8);
 		/* zero */mIn.skipCheckByte((byte) 0);
         byte type = mIn.readByte();
         int data = mIn.readInt();
 
         return type == TypedValue.TYPE_STRING
-                ? mPkg.getValueFactory().factory(mTableStrings.getHTML(data))
+                ? mPkg.getValueFactory().factory(mTableStrings.getHTML(data), data)
                 : mPkg.getValueFactory().factory(type, data, null);
     }
 
-    private ResConfigFlags readConfigFlags() throws IOException,
-            AndrolibException {
+    private ResConfigFlags readConfigFlags() throws IOException, AndrolibException {
         int size = mIn.readInt();
-        int read = 0;
+        int read = 28;
 
         if (size < 28) {
             throw new AndrolibException("Config size < 28");
@@ -320,9 +365,17 @@ public class ARSCDecoder {
             read = 48;
         }
 
+        byte screenLayout2 = 0;
+        if (size >= 52) {
+            screenLayout2 = mIn.readByte();
+            mIn.skipBytes(3); // reserved padding
+            read = 52;
+        }
+
         int exceedingSize = size - KNOWN_CONFIG_BYTES;
         if (exceedingSize > 0) {
             byte[] buf = new byte[exceedingSize];
+            read += exceedingSize;
             mIn.readFully(buf);
             BigInteger exceedingBI = new BigInteger(1, buf);
 
@@ -346,7 +399,7 @@ public class ARSCDecoder {
                 orientation, touchscreen, density, keyboard, navigation,
                 inputFlags, screenWidth, screenHeight, sdkVersion,
                 screenLayout, uiMode, smallestScreenWidthDp, screenWidthDp,
-                screenHeightDp, localeScript, localeVariant, isInvalid);
+                screenHeightDp, localeScript, localeVariant, screenLayout2, isInvalid, size);
     }
 
     private char[] unpackLanguageOrRegion(byte in0, byte in1, char base) throws AndrolibException {
@@ -378,6 +431,10 @@ public class ARSCDecoder {
         return string.toString();
     }
 
+    private void addTypeSpec(ResTypeSpec resTypeSpec) {
+        mResTypeSpecs.put(resTypeSpec.getId(), resTypeSpec);
+    }
+
     private void addMissingResSpecs() throws AndrolibException {
         int resId = mResId & 0xffff0000;
 
@@ -386,25 +443,36 @@ public class ARSCDecoder {
                 continue;
             }
 
-            ResResSpec spec = new ResResSpec(new ResID(resId | i), String.format("APKTOOL_DUMMY_%04x", i), mPkg, mType);
-            mPkg.addResSpec(spec);
-            mType.addResSpec(spec);
+            ResResSpec spec = new ResResSpec(new ResID(resId | i), "APKTOOL_DUMMY_" + Integer.toHexString(i), mPkg, mTypeSpec);
 
-            if (mConfig == null) {
-                mConfig = mPkg.getOrCreateConfig(new ResConfigFlags());
+            // If we already have this resID dont add it again.
+            if (! mPkg.hasResSpec(new ResID(resId | i))) {
+                mPkg.addResSpec(spec);
+                mTypeSpec.addResSpec(spec);
+
+                if (mType == null) {
+                    mType = mPkg.getOrCreateConfig(new ResConfigFlags());
+                }
+
+                ResValue value = new ResBoolValue(false, 0, null);
+                ResResource res = new ResResource(mType, spec, value);
+
+                mPkg.addResource(res);
+                mType.addResource(res);
+                spec.addResource(res);
             }
+        }
+    }
 
-            ResValue value = new ResBoolValue(false, null);
-            ResResource res = new ResResource(mConfig, spec, value);
-
-            mPkg.addResource(res);
-            mConfig.addResource(res);
-            spec.addResource(res);
+    private void removeResSpec(ResResSpec spec) throws AndrolibException {
+        if (mPkg.hasResSpec(spec.getId())) {
+            mPkg.removeResSpec(spec);
+            mTypeSpec.removeResSpec(spec);
         }
     }
 
     private Header nextChunk() throws IOException {
-        return mHeader = Header.read(mIn);
+        return mHeader = Header.read(mIn, mCountIn);
     }
 
     private void checkChunkType(int expectedType) throws AndrolibException {
@@ -414,8 +482,7 @@ public class ARSCDecoder {
         }
     }
 
-    private void nextChunkCheckType(int expectedType) throws IOException,
-            AndrolibException {
+    private void nextChunkCheckType(int expectedType) throws IOException, AndrolibException {
         nextChunk();
         checkChunkType(expectedType);
     }
@@ -431,36 +498,42 @@ public class ARSCDecoder {
     private StringBlock mTypeNames;
     private StringBlock mSpecNames;
     private ResPackage mPkg;
+    private ResTypeSpec mTypeSpec;
     private ResType mType;
-    private ResConfig mConfig;
     private int mResId;
     private boolean[] mMissingResSpecs;
+    private HashMap<Byte, ResTypeSpec> mResTypeSpecs = new HashMap<>();
 
     private final static short ENTRY_FLAG_COMPLEX = 0x0001;
 
     public static class Header {
         public final short type;
+        public final int headerSize;
         public final int chunkSize;
+        public final int startPosition;
+        public final int endPosition;
 
-        public Header(short type, int size) {
+        public Header(short type, int headerSize, int chunkSize, int headerStart) {
             this.type = type;
-            this.chunkSize = size;
+            this.headerSize = headerSize;
+            this.chunkSize = chunkSize;
+            this.startPosition = headerStart;
+            this.endPosition = headerStart + chunkSize;
         }
 
-        public static Header read(ExtDataInput in) throws IOException {
+        public static Header read(ExtDataInput in, CountingInputStream countIn) throws IOException {
             short type;
+            int start = countIn.getCount();
             try {
                 type = in.readShort();
             } catch (EOFException ex) {
-                return new Header(TYPE_NONE, 0);
+                return new Header(TYPE_NONE, 0, 0, countIn.getCount());
             }
-            in.skipBytes(2);
-            return new Header(type, in.readInt());
+            return new Header(type, in.readShort(), in.readInt(), start);
         }
 
         public final static short TYPE_NONE = -1, TYPE_TABLE = 0x0002,
-                TYPE_PACKAGE = 0x0200, TYPE_TYPE = 0x0202, TYPE_LIBRARY = 0x0203,
-                TYPE_CONFIG = 0x0201;
+                TYPE_PACKAGE = 0x0200, TYPE_TYPE = 0x0201, TYPE_SPEC_TYPE = 0x0202, TYPE_LIBRARY = 0x0203;
     }
 
     public static class FlagsOffset {
@@ -474,7 +547,7 @@ public class ARSCDecoder {
     }
 
     private static final Logger LOGGER = Logger.getLogger(ARSCDecoder.class.getName());
-    private static final int KNOWN_CONFIG_BYTES = 48;
+    private static final int KNOWN_CONFIG_BYTES = 52;
 
     public static class ARSCData {
 
@@ -506,20 +579,15 @@ public class ARSCDecoder {
         }
 
         public int findPackageWithMostResSpecs() {
-            int count = -1;
+            int count = mPackages[0].getResSpecCount();
             int id = 0;
 
-            // set starting point to package id 0.
-            count = mPackages[0].getResSpecCount();
-
-            // loop through packages looking for largest
             for (int i = 0; i < mPackages.length; i++) {
                 if (mPackages[i].getResSpecCount() >= count) {
                     count = mPackages[i].getResSpecCount();
                     id = i;
                 }
             }
-
             return id;
         }
 
